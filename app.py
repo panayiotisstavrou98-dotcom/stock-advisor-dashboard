@@ -2,7 +2,6 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
 
 # ---------- CONFIG ----------
 st.set_page_config(
@@ -44,16 +43,18 @@ def compute_signal(df):
     if len(df) < 60:
         return None
 
-    close = df["Close"]
-    last = float(close.iloc[-1])
+    # .squeeze() ensures we always get a 1-D Series regardless of yfinance version
+    close = df["Close"].squeeze()
+    if isinstance(close, pd.DataFrame):
+        close = close.iloc[:, 0]
 
-    m6 = float(last / float(close.iloc[0]) - 1)
-
+    last     = float(close.iloc[-1])
+    m6       = float(last / float(close.iloc[0]) - 1)
     high_52w = float(close.max())
     dist_high = float(last / high_52w - 1)
 
-    ret = close.pct_change()
-    vol_30 = float(ret[-30:].std() * (252 ** 0.5))
+    ret    = close.pct_change().dropna()
+    vol_30 = float(ret.tail(30).std() * (252 ** 0.5))
 
     score = 0
     if m6 > 0.10:
@@ -89,45 +90,42 @@ def compute_signal(df):
     score_scaled = (score + 5) * 10
 
     return {
-        "last_price": last,
-        "momentum_6m": m6,
+        "last_price":    last,
+        "momentum_6m":   m6,
         "dist_52w_high": dist_high,
-        "vol_30d": vol_30,
-        "score": score_scaled,
-        "signal": signal,
+        "vol_30d":       vol_30,
+        "score":         score_scaled,
+        "signal":        signal,
     }
 
 
 def build_signals_table(tickers, period):
     raw = fetch_data(tickers, period)
-    rows = []
-    charts = {}
+    rows, charts = [], {}
 
     for t, df in raw.items():
         res = compute_signal(df)
         if res is None:
             continue
-
         rows.append({
-            "Ticker": t,
-            "Last Price": res["last_price"],
-            "6M Momentum": res["momentum_6m"],
+            "Ticker":        t,
+            "Last Price":    res["last_price"],
+            "6M Momentum":   res["momentum_6m"],
             "Dist 52W High": res["dist_52w_high"],
-            "30D Vol": res["vol_30d"],
-            "Score": res["score"],
-            "Signal": res["signal"],
+            "30D Vol":       res["vol_30d"],
+            "Score":         res["score"],
+            "Signal":        res["signal"],
         })
         charts[t] = df
 
     if not rows:
         return pd.DataFrame(), charts
 
-    df_sig = pd.DataFrame(rows)
-    df_sig = df_sig.sort_values("Score", ascending=False).reset_index(drop=True)
+    df_sig = pd.DataFrame(rows).sort_values("Score", ascending=False).reset_index(drop=True)
     return df_sig, charts
 
 
-# ---------- MAIN LAYOUT ----------
+# ---------- MAIN ----------
 st.title("📈 Stock Advisor Dashboard")
 
 tickers = [t.strip().upper() for t in tickers_str.split(",") if t.strip()]
@@ -151,61 +149,61 @@ if df_view.empty:
     st.warning("No stocks meet the minimum score filter.")
     st.stop()
 
-# ---------- TOP METRICS ----------
+# --- KPIs ---
 col1, col2, col3, col4 = st.columns(4)
-n_strong_buy = (df_view["Signal"] == "Strong Buy").sum()
-n_buy = (df_view["Signal"] == "Buy").sum()
-avg_score = df_view["Score"].mean()
-n_total = len(df_view)
-
-col1.metric("Strong Buy", n_strong_buy)
-col2.metric("Buy", n_buy)
-col3.metric("Avg Score", f"{avg_score:.1f}")
-col4.metric("Stocks shown", n_total)
+col1.metric("🟢 Strong Buy", int((df_view["Signal"] == "Strong Buy").sum()))
+col2.metric("🟡 Buy",        int((df_view["Signal"] == "Buy").sum()))
+col3.metric("Avg Score",     f"{df_view['Score'].mean():.1f}")
+col4.metric("Stocks shown",  len(df_view))
 
 st.markdown("---")
 
-# ---------- TABLE + DETAILS ----------
+# --- TABLE + DETAILS ---
 left_col, right_col = st.columns([2, 1])
+
+SIGNAL_ICON = {"Strong Buy": "🟢", "Buy": "🟡", "Hold": "🔵", "Reduce": "🟠", "Sell": "🔴"}
 
 with left_col:
     st.subheader("Signals")
+    display = df_view.copy()
+    display["Signal"] = display["Signal"].apply(lambda s: f"{SIGNAL_ICON.get(s,'')} {s}")
     st.dataframe(
-        df_view.style.format({
-            "Last Price": "{:.2f}",
-            "6M Momentum": "{:.1%}",
+        display.style.format({
+            "Last Price":    "{:.2f}",
+            "6M Momentum":   "{:.1%}",
             "Dist 52W High": "{:.1%}",
-            "30D Vol": "{:.1%}",
-            "Score": "{:.0f}",
+            "30D Vol":       "{:.1%}",
+            "Score":         "{:.0f}",
         }),
         use_container_width=True,
-        height=400,
+        height=420,
     )
 
 with right_col:
     st.subheader("Details")
+    sel = st.selectbox("Pick a stock to inspect", df_view["Ticker"].tolist())
+    row = df_view[df_view["Ticker"] == sel].iloc[0]
 
-    selected_ticker = st.selectbox(
-        "Pick a stock to inspect",
-        df_view["Ticker"].tolist(),
-    )
+    icon = SIGNAL_ICON.get(row["Signal"], "")
+    st.markdown(f"### {sel}  {icon} {row['Signal']}")
+    st.markdown(f"""
+| Metric | Value |
+|---|---|
+| Last Price | **{row['Last Price']:.2f}** |
+| 6M Momentum | {row['6M Momentum']:.1%} |
+| Dist. 52W High | {row['Dist 52W High']:.1%} |
+| 30D Volatility | {row['30D Vol']:.1%} |
+| **Score** | **{row['Score']:.0f} / 100** |
+""")
 
-    row = df_view[df_view["Ticker"] == selected_ticker].iloc[0]
-
-    st.markdown(f"### {selected_ticker}")
-    st.write(f"**Signal:** {row['Signal']}  |  **Score:** {row['Score']:.0f}")
-    st.write(
-        f"**Last price:** {row['Last Price']:.2f}  \n"
-        f"**6M momentum:** {row['6M Momentum']:.1%}  \n"
-        f"**Dist. from 52W high:** {row['Dist 52W High']:.1%}  \n"
-        f"**30D volatility:** {row['30D Vol']:.1%}"
-    )
-
-    df_price = charts.get(selected_ticker)
+    df_price = charts.get(sel)
     if df_price is not None and not df_price.empty:
-        st.line_chart(df_price["Close"].tail(120), height=200, use_container_width=True)
+        price_series = df_price["Close"].squeeze()
+        if isinstance(price_series, pd.DataFrame):
+            price_series = price_series.iloc[:, 0]
+        st.line_chart(price_series.tail(252), height=220, use_container_width=True)
 
     st.caption(
-        "Heuristic rules combining trend (6M momentum), proximity to highs, and recent volatility. "
-        "Later you can replace this block with a full factor / ML engine."
+        "Score = momentum (6M return + dist from high + volatility). "
+        "Value & quality factors coming in next version."
     )
