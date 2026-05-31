@@ -3,3 +3,4 @@ pandas>=2.2.2
 numpy>=1.26.4
 yfinance>=0.2.40
 requests>=2.31.0
+scikit-learn>=1.4.0
