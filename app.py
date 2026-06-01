@@ -3,102 +3,99 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import requests
-import json
 import os
 import pickle
 from datetime import datetime, timedelta
 
-st.set_page_config(page_title="Stock Advisor", page_icon="📈", layout="wide")
+st.set_page_config(
+    page_title="Stock Intelligence",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-# ─── PERSISTENT STATE ─────────────────────────────────────────────────
-if "watchlist" not in st.session_state:
-    st.session_state["watchlist"] = set()
-if "owned" not in st.session_state:
-    st.session_state["owned"] = {}   # ticker -> qty, avg_price
-if "results" not in st.session_state:
-    st.session_state["results"] = None
-if "charts" not in st.session_state:
-    st.session_state["charts"] = {}
+# ─── CUSTOM CSS ──────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+/* Cleaner font & spacing */
+[data-testid="stAppViewContainer"] { background: #0e1117; }
+.block-container { padding-top: 1rem; padding-bottom: 1rem; }
+/* Metric cards */
+[data-testid="metric-container"] {
+    background: #1c2333;
+    border: 1px solid #2d3748;
+    border-radius: 10px;
+    padding: 12px 16px;
+}
+/* Tab styling */
+.stTabs [data-baseweb="tab-list"] { gap: 4px; }
+.stTabs [data-baseweb="tab"] {
+    background: #1c2333;
+    border-radius: 8px 8px 0 0;
+    padding: 6px 16px;
+    font-size: 13px;
+}
+.stTabs [aria-selected="true"] { background: #2d3748 !important; }
+/* Signal badge colours */
+.sig-strong-buy { color: #00c853; font-weight: 700; }
+.sig-buy        { color: #76ff03; font-weight: 700; }
+.sig-hold       { color: #40c4ff; font-weight: 700; }
+.sig-reduce     { color: #ff9100; font-weight: 700; }
+.sig-sell       { color: #ff1744; font-weight: 700; }
+/* Card container */
+.card {
+    background: #1c2333;
+    border: 1px solid #2d3748;
+    border-radius: 12px;
+    padding: 16px;
+    margin-bottom: 12px;
+}
+/* Sidebar cleaner */
+[data-testid="stSidebar"] { background: #141820; }
+</style>
+""", unsafe_allow_html=True)
 
-# ─── REGULARISED ML MODEL LOADER ──────────────────────────────────────
+# ─── SESSION STATE ────────────────────────────────────────────────────────────
+for key, default in [
+    ("watchlist",    set()),
+    ("owned",        {}),
+    ("results",      None),
+    ("charts",       {}),
+    ("prev_signals", {}),
+    ("discovery_results", None),
+    ("etf_results",  None),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+# ─── ML MODEL ─────────────────────────────────────────────────────────────────
 _ARTIFACTS = os.path.join(os.path.dirname(__file__), "artifacts")
 
 @st.cache_resource
 def load_ml_model():
-    """Load trained ElasticNet logistic model from ./artifacts/.
-    Returns (model, scaler, meta) or (None, None, None) if not yet trained."""
     try:
-        with open(os.path.join(_ARTIFACTS, "model.pkl"),  "rb") as f:
-            model  = pickle.load(f)
-        with open(os.path.join(_ARTIFACTS, "scaler.pkl"), "rb") as f:
-            scaler = pickle.load(f)
-        with open(os.path.join(_ARTIFACTS, "meta.pkl"),   "rb") as f:
-            meta   = pickle.load(f)
+        with open(os.path.join(_ARTIFACTS, "model.pkl"),  "rb") as f: model  = pickle.load(f)
+        with open(os.path.join(_ARTIFACTS, "scaler.pkl"), "rb") as f: scaler = pickle.load(f)
+        with open(os.path.join(_ARTIFACTS, "meta.pkl"),   "rb") as f: meta   = pickle.load(f)
         return model, scaler, meta
     except FileNotFoundError:
         return None, None, None
 
 ML_MODEL, ML_SCALER, ML_META = load_ml_model()
 
-# Feature columns must match exactly what train_model.py uses
-ML_FEATURE_COLS = [
-    "mom_1m", "mom_3m", "mom_6m", "mom_12m",
-    "above_ma50", "above_ma200",
-    "vol_30d", "max_drawdown", "dist_52w_high",
-]
+def get_ml_prob(m1, m3, m6, m12, ama50, ama200, vol, mdd, d52):
+    if ML_MODEL is None: return 0.5
+    feat = np.array([[m1, m3, m6, m12, float(ama50), float(ama200), vol, mdd, d52]])
+    return float(ML_MODEL.predict_proba(ML_SCALER.transform(feat))[0, 1])
 
+# ─── HELPERS ──────────────────────────────────────────────────────────────────
+SIGNAL_ICON  = {"Strong Buy": "🟢", "Buy": "🟡", "Hold": "🔵", "Reduce": "🟠", "Sell": "🔴"}
+SIGNAL_COLOR = {"Strong Buy": "#00c853", "Buy": "#76ff03", "Hold": "#40c4ff",
+                "Reduce": "#ff9100", "Sell": "#ff1744"}
 
-def get_ml_prob(mom_1m, mom_3m, mom_6m, mom_12m,
-               above_ma50, above_ma200,
-               vol_30d, max_drawdown, dist_52w_high):
-    """Return P(top-30% next month) from trained ElasticNet model.
-    Falls back to 0.5 (neutral) when artifacts are not present."""
-    if ML_MODEL is None:
-        return 0.5
-    feat = np.array([[mom_1m, mom_3m, mom_6m, mom_12m,
-                      float(above_ma50), float(above_ma200),
-                      vol_30d, max_drawdown, dist_52w_high]])
-    feat_s = ML_SCALER.transform(feat)
-    return float(ML_MODEL.predict_proba(feat_s)[0, 1])
-
-
-# ─── SIDEBAR ────────────────────────────────────────────────────────────────
-st.sidebar.title("⚙️ Settings")
-
-default_tickers = "AAPL, MSFT, NVDA, GOOGL, ASML, TSLA, AMZN, META"
-tickers_str = st.sidebar.text_input("Tickers (comma-separated)", value=default_tickers)
-period      = st.sidebar.selectbox("Lookback period", ["6mo", "1y", "2y"], index=1)
-min_score   = st.sidebar.slider("Min composite score", 0, 100, 0, 5)
-
-st.sidebar.markdown("### ⚖️ Factor weights")
-w_mom  = st.sidebar.slider("Momentum",  0, 100, 30, 5)
-w_val  = st.sidebar.slider("Value",     0, 100, 25, 5)
-w_qual = st.sidebar.slider("Quality",   0, 100, 25, 5)
-w_risk = st.sidebar.slider("Risk",      0, 100, 20, 5)
-st.sidebar.caption(f"Total: {w_mom+w_val+w_qual+w_risk} (should be 100)")
-
-st.sidebar.markdown("### 🚨 Hard risk caps")
-max_vol   = st.sidebar.slider("Max 30D vol before cap (annualised)", 0.20, 1.50, 0.80, 0.05)
-max_dd    = st.sidebar.slider("Max drawdown from 52W high before cap", -0.60, -0.05, -0.25, 0.05)
-
-st.sidebar.markdown("### 📰 News API (optional)")
-news_key = st.sidebar.text_input("NewsAPI key (leave blank to skip)", type="password")
-
-# ML model status indicator
-st.sidebar.markdown("### 🤖 ML Model")
-if ML_MODEL is not None:
-    trained_at = ML_META.get("trained_at", "unknown")[:10]
-    test_auc   = ML_META.get("test_auc", 0)
-    st.sidebar.success(f"✅ ElasticNet active  \nTrained: {trained_at}  \nTest AUC: {test_auc:.3f}")
-else:
-    st.sidebar.warning("⚠️ No model trained yet.  \nRun: `python train_model.py`")
-
-run_btn = st.sidebar.button("🔄 Run analysis")
-st.sidebar.markdown("---")
-st.sidebar.caption("Educational tool only — not investment advice.")
-
-# ─── HELPERS ────────────────────────────────────────────────────────────────
-ICON = {"Strong Buy": "🟢", "Buy": "🟡", "Hold": "🔵", "Reduce": "🟠", "Sell": "🔴"}
+def sig_badge(s):
+    c = SIGNAL_COLOR.get(s, "#aaa")
+    return f'<span style="background:{c}22;color:{c};border:1px solid {c}55;border-radius:6px;padding:2px 8px;font-size:12px;font-weight:700">{SIGNAL_ICON.get(s,"")} {s}</span>'
 
 def signal_from_score(s):
     if s >= 75: return "Strong Buy"
@@ -109,571 +106,637 @@ def signal_from_score(s):
 
 def safe_series(df, col):
     s = df[col].squeeze()
-    if isinstance(s, pd.DataFrame):
-        s = s.iloc[:, 0]
+    if isinstance(s, pd.DataFrame): s = s.iloc[:, 0]
     return s.dropna()
 
 def norm(val, lo, hi):
     if val is None or (hi - lo) == 0: return 50
     return float(min(max((val - lo) / (hi - lo) * 100, 0), 100))
 
-# ─── SECTOR DATA (for relative value) ──────────────────────────────────────
 SECTOR_MEDIAN_PE = {
     "Technology": 28, "Consumer Cyclical": 22, "Healthcare": 20,
     "Financial Services": 14, "Communication Services": 18,
     "Industrials": 20, "Consumer Defensive": 22, "Energy": 12,
-    "Basic Materials": 15, "Real Estate": 35, "Utilities": 18,
-    "default": 20
+    "Basic Materials": 15, "Real Estate": 35, "Utilities": 18, "default": 20
 }
 
-# ─── FACTOR MODULES ──────────────────────────────────────────────────────────
+# ─── FACTOR ENGINES ──────────────────────────────────────────────────────────
 def momentum_score(close):
-    last   = float(close.iloc[-1])
-    m1     = float(close.iloc[-1]/close.iloc[-21]  - 1) if len(close)>=21  else 0
-    m3     = float(close.iloc[-1]/close.iloc[-63]  - 1) if len(close)>=63  else 0
-    m6     = float(close.iloc[-1]/close.iloc[-126] - 1) if len(close)>=126 else 0
-    m12    = float(close.iloc[-1]/close.iloc[0]    - 1)
-    ma50   = float(close.tail(50).mean())
-    ma200  = float(close.tail(200).mean()) if len(close)>=200 else float(close.mean())
-    above_ma50  = last > ma50
-    above_ma200 = last > ma200
-    trend  = (10 if above_ma50 else 0) + (10 if above_ma200 else 0)
-    raw    = m1*0.20 + m6*0.40 + m12*0.40
-    base   = norm(raw, -0.50, 0.80)
-    return min(base+trend, 100), {
-        "m1": m1, "m3": m3, "m6": m6, "m12": m12,
-        "above_ma50": above_ma50, "above_ma200": above_ma200,
-    }
+    last = float(close.iloc[-1])
+    m1   = float(close.iloc[-1]/close.iloc[-21]  - 1) if len(close)>=21  else 0.0
+    m3   = float(close.iloc[-1]/close.iloc[-63]  - 1) if len(close)>=63  else 0.0
+    m6   = float(close.iloc[-1]/close.iloc[-126] - 1) if len(close)>=126 else 0.0
+    m12  = float(close.iloc[-1]/close.iloc[0]    - 1)
+    ma50  = float(close.tail(50).mean())
+    ma200 = float(close.tail(200).mean()) if len(close)>=200 else float(close.mean())
+    ama50, ama200 = last > ma50, last > ma200
+    trend = (10 if ama50 else 0) + (10 if ama200 else 0)
+    base  = norm(m1*0.20 + m6*0.40 + m12*0.40, -0.50, 0.80)
+    return min(base+trend, 100), {"m1":m1,"m3":m3,"m6":m6,"m12":m12,
+                                   "above_ma50":ama50,"above_ma200":ama200,
+                                   "ma50":ma50,"ma200":ma200}
 
 def value_score(info, sector="default"):
-    pe    = info.get("trailingPE") or info.get("forwardPE")
-    ps    = info.get("priceToSalesTrailing12Months")
-    ev_e  = info.get("enterpriseToEbitda")
-    mktcap= info.get("marketCap")
-    fcf   = info.get("freeCashflow")
-    fcfy  = (fcf/mktcap) if (fcf and mktcap and mktcap>0) else None
-    sector_pe = SECTOR_MEDIAN_PE.get(sector, SECTOR_MEDIAN_PE["default"])
-    parts = []
-    if pe and pe>0:
-        rel_pe = pe / sector_pe
-        parts.append(max(min((2 - rel_pe) * 50, 100), 0))
-    if ps  and ps>0:  parts.append(100-norm(ps, 0.5, 20))
-    if ev_e and ev_e>0: parts.append(100-norm(ev_e, 3, 40))
-    if fcfy:          parts.append(norm(fcfy, -0.05, 0.15))
-    score = float(np.mean(parts)) if parts else 50
-    return max(min(score,100),0), {"pe":pe,"ps":ps,"ev_ebitda":ev_e,
-                                    "fcf_yield":fcfy,"sector":sector,
-                                    "sector_median_pe":sector_pe}
+    pe   = info.get("trailingPE") or info.get("forwardPE")
+    ps   = info.get("priceToSalesTrailing12Months")
+    ev_e = info.get("enterpriseToEbitda")
+    mkt  = info.get("marketCap")
+    fcf  = info.get("freeCashflow")
+    fcfy = (fcf/mkt) if (fcf and mkt and mkt>0) else None
+    spe  = SECTOR_MEDIAN_PE.get(sector, SECTOR_MEDIAN_PE["default"])
+    pts  = []
+    if pe and pe>0:   pts.append(max(min((2 - pe/spe)*50, 100), 0))
+    if ps and ps>0:   pts.append(100-norm(ps, 0.5, 20))
+    if ev_e and ev_e>0: pts.append(100-norm(ev_e, 3, 40))
+    if fcfy:          pts.append(norm(fcfy, -0.05, 0.15))
+    score = float(np.mean(pts)) if pts else 50
+    return max(min(score,100),0), {"pe":pe,"ps":ps,"ev_ebitda":ev_e,"fcf_yield":fcfy,
+                                    "sector":sector,"sector_median_pe":spe}
 
 def quality_score(info):
-    roe     = info.get("returnOnEquity")
-    margin  = info.get("profitMargins")
-    de      = info.get("debtToEquity")
-    cr      = info.get("currentRatio")
-    ocf     = info.get("operatingCashflow")
-    ni      = info.get("netIncomeToCommon")
-    accrual = None
-    if ocf and ni and ni != 0:
-        accrual = ocf / abs(ni)
-    parts = []
-    if roe    is not None: parts.append(norm(roe,    -0.10, 0.40))
-    if margin is not None: parts.append(norm(margin, -0.05, 0.35))
-    if de     is not None: parts.append(100-norm(de, 0, 200))
-    if cr     is not None: parts.append(norm(cr, 0.5, 3.0))
-    if accrual is not None: parts.append(norm(accrual, 0.5, 2.5))
-    score = float(np.mean(parts)) if parts else 50
+    roe, margin = info.get("returnOnEquity"), info.get("profitMargins")
+    de,  cr     = info.get("debtToEquity"),   info.get("currentRatio")
+    ocf, ni     = info.get("operatingCashflow"), info.get("netIncomeToCommon")
+    accrual = (ocf/abs(ni)) if (ocf and ni and ni!=0) else None
+    pts = []
+    if roe    is not None: pts.append(norm(roe,    -0.10, 0.40))
+    if margin is not None: pts.append(norm(margin, -0.05, 0.35))
+    if de     is not None: pts.append(100-norm(de, 0, 200))
+    if cr     is not None: pts.append(norm(cr, 0.5, 3.0))
+    if accrual is not None: pts.append(norm(accrual, 0.5, 2.5))
+    score = float(np.mean(pts)) if pts else 50
     return max(min(score,100),0), {"roe":roe,"profit_margin":margin,
-                                    "debt_equity":de,"current_ratio":cr,
-                                    "accrual_ratio":accrual}
+                                    "debt_equity":de,"current_ratio":cr,"accrual_ratio":accrual}
 
 def risk_score_fn(close):
     ret     = close.pct_change().dropna()
     vol_30  = float(ret.tail(30).std() * (252**0.5))
-    high_52 = float(close.max())
-    dist_hi = float(close.iloc[-1]/high_52 - 1)
-    roll_max = close.cummax()
-    dd       = ((close - roll_max)/roll_max)
-    max_dd   = float(dd.min())
-    vol_s   = 100-norm(vol_30, 0.10, 0.80)
-    dist_s  = norm(dist_hi, -0.50, 0.0)
-    dd_s    = 100-norm(abs(max_dd), 0, 0.60)
-    score   = vol_s*0.4 + dist_s*0.3 + dd_s*0.3
+    dist_hi = float(close.iloc[-1]/close.max() - 1)
+    max_dd  = float(((close - close.cummax())/close.cummax()).min())
+    score   = (100-norm(vol_30,0.10,0.80))*0.4 + norm(dist_hi,-0.50,0.0)*0.3 + (100-norm(abs(max_dd),0,0.60))*0.3
     return max(min(score,100),0), {"vol_30d":vol_30,"dist_52w_high":dist_hi,"max_dd":max_dd}
 
 def sentiment_score_fn(info, ticker, news_key):
-    rec   = info.get("recommendationMean")
-    eps_s = info.get("earningsQuarterlyGrowth")
-    news_sent = 50
-    headlines = []
+    rec, eps_s = info.get("recommendationMean"), info.get("earningsQuarterlyGrowth")
+    news_sent, headlines = 50, []
     if news_key:
         try:
-            url = (f"https://newsapi.org/v2/everything?"
-                   f"q={ticker}&language=en&sortBy=publishedAt"
-                   f"&from={(datetime.now()-timedelta(days=7)).strftime('%Y-%m-%d')}"
+            url = (f"https://newsapi.org/v2/everything?q={ticker}&language=en"
+                   f"&sortBy=publishedAt&from={(datetime.now()-timedelta(days=7)).strftime('%Y-%m-%d')}"
                    f"&pageSize=10&apiKey={news_key}")
             r = requests.get(url, timeout=5)
             if r.status_code == 200:
-                articles = r.json().get("articles", [])
+                articles  = r.json().get("articles", [])
                 headlines = [a["title"] for a in articles if a.get("title")]
-                pos_words = ["beat","surge","strong","record","growth","upgraded","outperform","rally","profit"]
-                neg_words = ["miss","fall","weak","loss","downgrade","underperform","crash","cut","decline"]
-                pos = sum(1 for h in headlines for w in pos_words if w in h.lower())
-                neg = sum(1 for h in headlines for w in neg_words if w in h.lower())
-                if (pos + neg) > 0:
-                    news_sent = (pos/(pos+neg))*100
-        except Exception:
-            pass
-    parts = []
-    if rec:   parts.append(100 - norm(rec, 1, 5))
-    if eps_s: parts.append(norm(eps_s, -0.30, 0.50))
-    parts.append(news_sent)
-    score = float(np.mean(parts)) if parts else 50
-    return max(min(score,100),0), {"recommendation":rec,"earnings_surprise":eps_s,
-                                    "news_sentiment":news_sent,"headlines":headlines}
+                pos = sum(1 for h in headlines for w in ["beat","surge","strong","record","growth","upgraded","outperform","rally","profit"] if w in h.lower())
+                neg = sum(1 for h in headlines for w in ["miss","fall","weak","loss","downgrade","underperform","crash","cut","decline"] if w in h.lower())
+                if (pos+neg) > 0: news_sent = (pos/(pos+neg))*100
+        except Exception: pass
+    pts = []
+    if rec:   pts.append(100 - norm(rec, 1, 5))
+    if eps_s: pts.append(norm(eps_s, -0.30, 0.50))
+    pts.append(news_sent)
+    return max(min(float(np.mean(pts)) if pts else 50, 100), 0), \
+           {"recommendation":rec,"earnings_surprise":eps_s,
+            "news_sentiment":news_sent,"headlines":headlines}
 
-# ─── HARD RISK CAP ──────────────────────────────────────────────────────────────
 def apply_hard_caps(signal, score, vol_30d, dist_52w_high, max_vol_cap, max_dd_cap):
-    capped = False
     reason = ""
     if vol_30d > max_vol_cap:
-        capped = True
         reason = f"Vol {vol_30d:.0%} > cap {max_vol_cap:.0%}"
     if dist_52w_high < max_dd_cap:
-        capped = True
-        reason += (" | " if reason else "") + f"Drawdown {dist_52w_high:.0%} < cap {max_dd_cap:.0%}"
-    if capped and signal in ["Strong Buy", "Buy"]:
-        return "Hold", min(score, 44), f"⚠️ Capped: {reason}"
+        reason += (" | " if reason else "") + f"DD {dist_52w_high:.0%} < cap {max_dd_cap:.0%}"
+    if reason and signal in ["Strong Buy", "Buy"]:
+        return "Hold", min(score, 44), f"⚠️ {reason}"
     return signal, score, ""
 
-# ─── BACKTEST ────────────────────────────────────────────────────────────────────
-def simple_backtest(charts, df_results):
-    buy_tickers = df_results[df_results["Signal"].isin(["Strong Buy","Buy"])]["Ticker"].tolist()
-    if not buy_tickers:
+# ─── CORE ANALYSIS ────────────────────────────────────────────────────────────
+def analyse_ticker(ticker, period, w_mom, w_val, w_qual, w_risk, news_key, max_vol_cap, max_dd_cap):
+    try:
+        tk = yf.Ticker(ticker)
+        df = tk.history(period=period, auto_adjust=True)
+        if df.empty or len(df) < 60: return None, None
+        close  = safe_series(df, "Close")
+        info   = tk.info or {}
+        sector = info.get("sector", "default")
+        name   = info.get("shortName", ticker)
+
+        ms, mm = momentum_score(close)
+        vs, vm = value_score(info, sector)
+        qs, qm = quality_score(info)
+        rs, rm = risk_score_fn(close)
+        ss, sm = sentiment_score_fn(info, ticker, news_key)
+
+        ml_prob      = get_ml_prob(mm["m1"],mm["m3"],mm["m6"],mm["m12"],
+                                   mm["above_ma50"],mm["above_ma200"],
+                                   rm["vol_30d"],rm["max_dd"],rm["dist_52w_high"])
+        ml_score_100 = round(ml_prob * 100, 1)
+
+        total_w    = w_mom + w_val + w_qual + w_risk or 100
+        rules_comp = (ms*w_mom + vs*w_val + qs*w_qual + rs*w_risk) / total_w
+        comp       = round(min(max(rules_comp*0.70 + ml_score_100*0.30, 0), 100), 1)
+
+        sig = signal_from_score(comp)
+        sig, comp, cap = apply_hard_caps(sig, comp, rm["vol_30d"], rm["dist_52w_high"],
+                                         max_vol_cap, max_dd_cap)
+        mktcap = info.get("marketCap", 0) or 0
+        return {
+            "Ticker":       ticker, "Name": name, "Sector": sector,
+            "Market Cap":   mktcap,
+            "Last Price":   round(float(close.iloc[-1]), 2),
+            "Mom Score":    round(ms, 1), "Value Score": round(vs, 1),
+            "Qual Score":   round(qs, 1), "Risk Score":  round(rs, 1),
+            "Sentiment":    round(ss, 1), "ML Prob":     round(ml_prob, 3),
+            "ML Score":     ml_score_100, "Composite":   comp,
+            "Signal":       sig, "Cap Reason": cap,
+            "1M Mom":       mm["m1"], "3M Mom": mm["m3"],
+            "6M Mom":       mm["m6"], "12M Mom": mm["m12"],
+            "Above MA50":   "✅" if mm["above_ma50"]  else "❌",
+            "Above MA200":  "✅" if mm["above_ma200"] else "❌",
+            "P/E":          vm.get("pe"),   "P/S":      vm.get("ps"),
+            "EV/EBITDA":    vm.get("ev_ebitda"), "FCF Yield": vm.get("fcf_yield"),
+            "Sector PE":    vm.get("sector_median_pe"),
+            "ROE":          qm.get("roe"),  "Margin":   qm.get("profit_margin"),
+            "D/E":          qm.get("debt_equity"), "Curr Ratio": qm.get("current_ratio"),
+            "Accrual":      qm.get("accrual_ratio"),
+            "30D Vol":      rm["vol_30d"], "Dist 52W Hi": rm["dist_52w_high"],
+            "Max DD":       rm["max_dd"],
+            "Analyst Rec":  sm.get("recommendation"), "EPS Surprise": sm.get("earnings_surprise"),
+            "News Sent":    sm.get("news_sentiment"),  "Headlines":    sm.get("headlines", []),
+            "_close":       close,
+        }, df
+    except Exception:
         return None, None
+
+# ─── DISCOVERY ENGINE ─────────────────────────────────────────────────────────
+# Universe: 120 liquid stocks across all sectors (small/mid/large cap)
+DISCOVERY_UNIVERSE = [
+    # Mega/Large Tech
+    "AAPL","MSFT","NVDA","GOOGL","AMZN","META","TSLA","AMD","AVGO","QCOM",
+    "INTC","TXN","MU","AMAT","KLAC","LRCX","CRWD","PANW","SNOW","PLTR",
+    # Healthcare
+    "LLY","UNH","JNJ","ABBV","MRK","TMO","ABT","ISRG","DXCM","MRNA",
+    # Financials
+    "JPM","BAC","GS","MS","V","MA","AXP","BLK","SCHW","COF",
+    # Consumer
+    "AMZN","COST","WMT","MCD","SBUX","NKE","TGT","HD","LOW","ABNB",
+    # Energy
+    "XOM","CVX","COP","SLB","EOG","PXD","MPC","VLO",
+    # Industrials
+    "CAT","DE","HON","RTX","BA","GE","UPS","FDX","ETN","ROK",
+    # Comm & Media
+    "NFLX","DIS","SPOT","SNAP","PINS","TTD",
+    # Small/Mid growth
+    "CELH","HIMS","RXRX","IONQ","RKLB","JOBY","AEHR","UPST","SQ","HOOD",
+    "COIN","MSTR","SMCI","APP","DUOL","SOUN","BBAI","ARRY","ENPH","FSLR",
+    # International ADRs
+    "ASML","TSM","BABA","JD","NVO","SAP","SE","GRAB","NU","MELI",
+]
+DISCOVERY_UNIVERSE = list(dict.fromkeys(DISCOVERY_UNIVERSE))  # deduplicate
+
+# Day-trading candidates: high-vol liquid names
+DAY_TRADE_UNIVERSE = [
+    "NVDA","TSLA","AMD","AAPL","META","AMZN","GOOGL","MSFT","SPY","QQQ",
+    "COIN","MSTR","PLTR","SMCI","HOOD","SQ","SNAP","RKLB","IONQ","UPST",
+    "APP","CRWD","PANW","MU","AVGO","NFLX","CELH","HIMS","SOUN","BBAI",
+]
+
+@st.cache_data(ttl=1800)
+def run_discovery_scan(universe, scan_type="growth"):
+    results = []
+    for ticker in universe:
+        try:
+            tk    = yf.Ticker(ticker)
+            df    = tk.history(period="6mo", auto_adjust=True)
+            if df.empty or len(df) < 30: continue
+            close = safe_series(df, "Close")
+            info  = tk.info or {}
+            vol   = safe_series(df, "Volume")
+
+            price  = float(close.iloc[-1])
+            m1     = float(close.iloc[-1]/close.iloc[-21]  - 1) if len(close)>=21  else 0
+            m3     = float(close.iloc[-1]/close.iloc[-63]  - 1) if len(close)>=63  else 0
+            m6     = float(close.iloc[-1]/close.iloc[0]    - 1)
+            ma50   = float(close.tail(50).mean())
+            ma200  = float(close.tail(200).mean()) if len(close)>=200 else float(close.mean())
+            ret    = close.pct_change().dropna()
+            vol30  = float(ret.tail(30).std() * (252**0.5))
+            dist_hi= float(close.iloc[-1]/close.max() - 1)
+            max_dd = float(((close - close.cummax())/close.cummax()).min())
+
+            # Volume stats
+            avg_vol   = float(vol.tail(20).mean()) if len(vol)>=20 else float(vol.mean())
+            last_vol  = float(vol.iloc[-1])
+            rvol      = last_vol / avg_vol if avg_vol > 0 else 1.0
+
+            # ATR (14-day)
+            hi = safe_series(df, "High").tail(15)
+            lo = safe_series(df, "Low").tail(15)
+            atr = float((hi - lo).tail(14).mean())
+            atr_pct = atr / price if price > 0 else 0
+
+            mktcap = info.get("marketCap", 0) or 0
+            sector = info.get("sector", "Unknown")
+            name   = info.get("shortName", ticker)
+
+            if scan_type == "day_trade":
+                # Day trade score: wants high RVOL, high ATR%, strong recent momentum
+                score  = norm(rvol, 0.5, 5.0)*0.35 + norm(atr_pct, 0.01, 0.08)*0.30 \
+                       + norm(m1, -0.15, 0.20)*0.20 + norm(vol30, 0.20, 1.20)*0.15
+                results.append({
+                    "Ticker": ticker, "Name": name, "Sector": sector,
+                    "Price": round(price, 2), "Day Score": round(score, 1),
+                    "RVOL": round(rvol, 2), "ATR %": round(atr_pct*100, 2),
+                    "1M Mom": m1, "Vol 30D": round(vol30*100, 1),
+                    "Above MA50": "✅" if price>ma50 else "❌",
+                    "Market Cap": mktcap,
+                })
+            else:  # growth
+                # Golden cross + breakout + earnings momentum
+                golden = price > ma50 > ma200
+                breakout_52 = dist_hi > -0.05  # within 5% of 52W high
+                eps_g  = info.get("earningsQuarterlyGrowth") or 0
+                rev_g  = info.get("revenueGrowth") or 0
+                pe     = info.get("trailingPE") or info.get("forwardPE") or 0
+                score  = norm(m3, -0.20, 0.60)*0.25 + norm(m6, -0.30, 0.80)*0.25 \
+                       + norm(eps_g, -0.10, 0.50)*0.20 + norm(rev_g, -0.05, 0.40)*0.15 \
+                       + (10 if golden else 0) + (5 if breakout_52 else 0)
+                score  = min(score, 100)
+                results.append({
+                    "Ticker": ticker, "Name": name, "Sector": sector,
+                    "Price": round(price, 2), "Growth Score": round(score, 1),
+                    "3M Mom": m3, "6M Mom": m6,
+                    "EPS Growth": eps_g, "Rev Growth": rev_g,
+                    "Golden Cross": "✅" if golden else "❌",
+                    "Near 52W Hi": "✅" if breakout_52 else "❌",
+                    "P/E": pe if pe and pe > 0 else None,
+                    "Market Cap": mktcap, "Sector": sector,
+                })
+        except Exception:
+            continue
+    if not results: return pd.DataFrame()
+    df_out = pd.DataFrame(results)
+    score_col = "Day Score" if scan_type == "day_trade" else "Growth Score"
+    return df_out.sort_values(score_col, ascending=False).reset_index(drop=True)
+
+# ─── ETF ENGINE ───────────────────────────────────────────────────────────────
+ETF_UNIVERSE = {
+    # Broad market
+    "SPY":  {"name": "S&P 500",         "category": "Broad",    "exp": 0.0945},
+    "QQQ":  {"name": "Nasdaq 100",       "category": "Broad",    "exp": 0.20},
+    "IWM":  {"name": "Russell 2000",     "category": "Broad",    "exp": 0.19},
+    "VTI":  {"name": "Total US Market",  "category": "Broad",    "exp": 0.03},
+    "VT":   {"name": "Total World",      "category": "Broad",    "exp": 0.07},
+    # Sector
+    "XLK":  {"name": "Tech",             "category": "Sector",   "exp": 0.10},
+    "XLF":  {"name": "Financials",       "category": "Sector",   "exp": 0.10},
+    "XLE":  {"name": "Energy",           "category": "Sector",   "exp": 0.10},
+    "XLV":  {"name": "Healthcare",       "category": "Sector",   "exp": 0.10},
+    "XLI":  {"name": "Industrials",      "category": "Sector",   "exp": 0.10},
+    "XLC":  {"name": "Comm Services",    "category": "Sector",   "exp": 0.10},
+    "XLY":  {"name": "Consumer Discr.",  "category": "Sector",   "exp": 0.10},
+    "XLRE": {"name": "Real Estate",      "category": "Sector",   "exp": 0.10},
+    # Thematic
+    "SOXX": {"name": "Semiconductors",   "category": "Thematic", "exp": 0.35},
+    "ARKK": {"name": "ARK Innovation",   "category": "Thematic", "exp": 0.75},
+    "ARKG": {"name": "ARK Genomic",      "category": "Thematic", "exp": 0.75},
+    "AIQ":  {"name": "AI & Big Data",    "category": "Thematic", "exp": 0.68},
+    "BOTZ": {"name": "Robotics & AI",    "category": "Thematic", "exp": 0.69},
+    "CIBR": {"name": "Cybersecurity",    "category": "Thematic", "exp": 0.60},
+    "ICLN": {"name": "Clean Energy",     "category": "Thematic", "exp": 0.41},
+    # Bonds / Defensive
+    "TLT":  {"name": "20Y Treasury",     "category": "Bonds",    "exp": 0.15},
+    "HYG":  {"name": "High Yield Bond",  "category": "Bonds",    "exp": 0.48},
+    "AGG":  {"name": "US Agg Bond",      "category": "Bonds",    "exp": 0.03},
+    # Commodities
+    "GLD":  {"name": "Gold",             "category": "Commodity","exp": 0.40},
+    "SLV":  {"name": "Silver",           "category": "Commodity","exp": 0.50},
+    "USO":  {"name": "Oil",              "category": "Commodity","exp": 0.81},
+}
+
+@st.cache_data(ttl=1800)
+def run_etf_scan():
+    rows = []
+    tickers = list(ETF_UNIVERSE.keys())
+    for ticker in tickers:
+        meta = ETF_UNIVERSE[ticker]
+        try:
+            tk    = yf.Ticker(ticker)
+            df    = tk.history(period="1y", auto_adjust=True)
+            if df.empty or len(df) < 30: continue
+            close = safe_series(df, "Close")
+            vol_s = safe_series(df, "Volume")
+            price = float(close.iloc[-1])
+            m1    = float(close.iloc[-1]/close.iloc[-21]  - 1) if len(close)>=21  else 0
+            m3    = float(close.iloc[-1]/close.iloc[-63]  - 1) if len(close)>=63  else 0
+            m6    = float(close.iloc[-1]/close.iloc[-126] - 1) if len(close)>=126 else 0
+            m12   = float(close.iloc[-1]/close.iloc[0]    - 1)
+            ma50  = float(close.tail(50).mean())
+            ma200 = float(close.tail(200).mean()) if len(close)>=200 else float(close.mean())
+            ret   = close.pct_change().dropna()
+            vol30 = float(ret.tail(30).std()*(252**0.5))
+            dist  = float(close.iloc[-1]/close.max() - 1)
+            max_dd= float(((close-close.cummax())/close.cummax()).min())
+            avg_vol  = float(vol_s.tail(20).mean())
+            rvol     = float(vol_s.iloc[-1]/avg_vol) if avg_vol>0 else 1.0
+            # ETF momentum score (no value/quality — expense ratio penalty instead)
+            mom_s   = norm(m1*0.20+m3*0.30+m6*0.30+m12*0.20, -0.30, 0.60)
+            risk_s  = (100-norm(vol30,0.05,0.50))*0.5 + norm(dist,-0.40,0.0)*0.5
+            exp_pen = max(0, 100 - meta["exp"]*100)  # lower expense = better
+            etf_score = round(mom_s*0.55 + risk_s*0.35 + exp_pen*0.10, 1)
+            rows.append({
+                "Ticker": ticker, "Name": meta["name"], "Category": meta["category"],
+                "Price": round(price, 2), "ETF Score": etf_score,
+                "1M": m1, "3M": m3, "6M": m6, "12M": m12,
+                "Vol 30D": round(vol30*100, 1), "Max DD": max_dd,
+                "Dist 52W Hi": dist, "RVOL": round(rvol, 2),
+                "Exp Ratio %": meta["exp"], "Trend": "✅" if price>ma50>ma200 else ("➡️" if price>ma50 else "❌"),
+                "_close": close,
+            })
+        except Exception:
+            continue
+    if not rows: return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values("ETF Score", ascending=False).reset_index(drop=True)
+
+# ─── BACKTEST ─────────────────────────────────────────────────────────────────
+def run_backtest(charts, df_results):
+    buy_tickers = df_results[df_results["Signal"].isin(["Strong Buy","Buy"])]["Ticker"].tolist()
+    if not buy_tickers: return None, None, None
     returns = {}
     for t in buy_tickers:
         df = charts.get(t)
         if df is None: continue
         s = safe_series(df, "Close").pct_change().dropna()
         returns[t] = s
-    if not returns:
-        return None, None
-    ret_df   = pd.DataFrame(returns).dropna()
-    port     = ret_df.mean(axis=1)
-    cum_port = (1 + port).cumprod() - 1
+    if not returns: return None, None, None
+    port     = pd.DataFrame(returns).dropna().mean(axis=1)
+    cum_port = (1+port).cumprod() - 1
     try:
-        spy = yf.download("SPY", period="1y", auto_adjust=True, progress=False)
-        spy_close = safe_series(spy, "Close")
-        spy_ret   = spy_close.pct_change().dropna()
+        spy       = yf.download("SPY", period="1y", auto_adjust=True, progress=False)
+        spy_ret   = safe_series(spy, "Close").pct_change().dropna()
         spy_ret.index = spy_ret.index.tz_localize(None) if spy_ret.index.tzinfo else spy_ret.index
         port.index    = port.index.tz_localize(None)    if port.index.tzinfo    else port.index
         combined  = pd.DataFrame({"Portfolio": port, "SPY": spy_ret}).dropna()
-        return cum_port, (1 + combined).cumprod() - 1
+        cum_both  = (1+combined).cumprod() - 1
     except Exception:
-        return cum_port, None
+        cum_both = None
+    # Stats
+    ann_ret  = float((1+port.mean())**252 - 1)
+    ann_vol  = float(port.std() * (252**0.5))
+    sharpe   = round(ann_ret / ann_vol, 2) if ann_vol > 0 else 0
+    neg      = port[port < 0]
+    sortino  = round(ann_ret / (neg.std()*(252**0.5)), 2) if len(neg)>0 else 0
+    mdd      = float(((cum_port+1 - (cum_port+1).cummax())/(cum_port+1).cummax()).min())
+    win_rate = round((port > 0).mean() * 100, 1)
+    stats    = {"ann_ret": ann_ret, "ann_vol": ann_vol, "sharpe": sharpe,
+                "sortino": sortino, "max_dd": mdd, "win_rate": win_rate}
+    return cum_port, cum_both, stats
 
-# ─── MAIN ANALYSIS ENGINE ──────────────────────────────────────────────────────
-def analyse_ticker(ticker, period, w_mom, w_val, w_qual, w_risk,
-                   news_key, max_vol_cap, max_dd_cap):
-    try:
-        tk     = yf.Ticker(ticker)
-        df     = tk.history(period=period, auto_adjust=True)
-        if df.empty or len(df) < 60:
-            return None, None
-        close  = safe_series(df, "Close")
-        info   = tk.info or {}
-        sector = info.get("sector", "default")
+# ─── SIDEBAR ──────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("## 📈 Stock Intelligence")
+    st.markdown("---")
 
-        ms, m_meta = momentum_score(close)
-        vs, v_meta = value_score(info, sector)
-        qs, q_meta = quality_score(info)
-        rs, r_meta = risk_score_fn(close)
-        ss, s_meta = sentiment_score_fn(info, ticker, news_key)
+    st.markdown("### 🎯 Watchlist Tickers")
+    tickers_str = st.text_area("Tickers (one per line or comma-sep)",
+                               value="AAPL\nMSFT\nNVDA\nGOOGL\nASML\nTSLA\nAMZN\nMETA",
+                               height=130)
+    period    = st.selectbox("Lookback period", ["6mo", "1y", "2y"], index=1)
+    min_score = st.slider("Min composite score", 0, 100, 0, 5)
 
-        # ── Real ElasticNet ML score ──────────────────────────────────────
-        # Uses the same 9 features as train_model.py
-        ml_prob = get_ml_prob(
-            mom_1m       = m_meta["m1"],
-            mom_3m       = m_meta["m3"],
-            mom_6m       = m_meta["m6"],
-            mom_12m      = m_meta["m12"],
-            above_ma50   = m_meta["above_ma50"],
-            above_ma200  = m_meta["above_ma200"],
-            vol_30d      = r_meta["vol_30d"],
-            max_drawdown = r_meta["max_dd"],
-            dist_52w_high= r_meta["dist_52w_high"],
-        )
-        ml_score_100 = round(ml_prob * 100, 1)   # convert to 0-100 for display
+    with st.expander("⚖️ Factor weights", expanded=False):
+        w_mom  = st.slider("Momentum",  0, 100, 30, 5)
+        w_val  = st.slider("Value",     0, 100, 25, 5)
+        w_qual = st.slider("Quality",   0, 100, 25, 5)
+        w_risk = st.slider("Risk",      0, 100, 20, 5)
+        total_w_ui = w_mom+w_val+w_qual+w_risk
+        if total_w_ui != 100:
+            st.warning(f"Total: {total_w_ui} (should be 100)")
+        else:
+            st.success(f"Total: {total_w_ui} ✓")
 
-        # ── Composite: 70% rules-based + 30% ElasticNet ML ───────────────
-        total_w = w_mom + w_val + w_qual + w_risk or 100
-        rules_comp = (ms*w_mom + vs*w_val + qs*w_qual + rs*w_risk) / total_w
-        comp = rules_comp * 0.70 + ml_score_100 * 0.30
-        comp = round(min(max(comp, 0), 100), 1)
+    with st.expander("🚨 Risk caps", expanded=False):
+        max_vol = st.slider("Max annualised 30D vol", 0.20, 1.50, 0.80, 0.05)
+        max_dd  = st.slider("Max drawdown from 52W hi", -0.60, -0.05, -0.25, 0.05)
 
-        sig = signal_from_score(comp)
-        sig, comp, cap_reason = apply_hard_caps(
-            sig, comp,
-            r_meta["vol_30d"], r_meta["dist_52w_high"],
-            max_vol_cap, max_dd_cap
-        )
+    with st.expander("📰 News & ML", expanded=False):
+        news_key = st.text_input("NewsAPI key (optional)", type="password")
+        if ML_MODEL is not None:
+            st.success(f"🤖 ElasticNet active\nAUC: {ML_META.get('test_auc',0):.3f}")
+        else:
+            st.warning("⚠️ Run `python train_model.py`")
 
-        return {
-            "Ticker":        ticker,
-            "Sector":        sector,
-            "Last Price":    round(float(close.iloc[-1]), 2),
-            "Mom Score":     round(ms, 1),
-            "Value Score":   round(vs, 1),
-            "Qual Score":    round(qs, 1),
-            "Risk Score":    round(rs, 1),
-            "Sentiment":     round(ss, 1),
-            "ML Prob":       round(ml_prob, 3),       # raw probability 0-1
-            "ML Score":      ml_score_100,            # 0-100 for display
-            "Composite":     comp,
-            "Signal":        sig,
-            "Cap Reason":    cap_reason,
-            "1M Mom":        m_meta["m1"],
-            "3M Mom":        m_meta["m3"],
-            "6M Mom":        m_meta["m6"],
-            "12M Mom":       m_meta["m12"],
-            "Above MA50":    "✅" if m_meta["above_ma50"]  else "❌",
-            "Above MA200":   "✅" if m_meta["above_ma200"] else "❌",
-            "P/E":           v_meta.get("pe"),
-            "P/S":           v_meta.get("ps"),
-            "EV/EBITDA":     v_meta.get("ev_ebitda"),
-            "FCF Yield":     v_meta.get("fcf_yield"),
-            "Sector PE":     v_meta.get("sector_median_pe"),
-            "ROE":           q_meta.get("roe"),
-            "Margin":        q_meta.get("profit_margin"),
-            "D/E":           q_meta.get("debt_equity"),
-            "Curr Ratio":    q_meta.get("current_ratio"),
-            "Accrual":       q_meta.get("accrual_ratio"),
-            "30D Vol":       r_meta["vol_30d"],
-            "Dist 52W Hi":   r_meta["dist_52w_high"],
-            "Max DD":        r_meta["max_dd"],
-            "Analyst Rec":   s_meta.get("recommendation"),
-            "EPS Surprise":  s_meta.get("earnings_surprise"),
-            "News Sent":     s_meta.get("news_sentiment"),
-            "Headlines":     s_meta.get("headlines", []),
-        }, df
-    except Exception:
-        return None, None
+    st.markdown("---")
+    run_btn = st.button("🔄 Run Analysis", use_container_width=True, type="primary")
+    st.caption("Educational tool only — not investment advice.")
 
+# ─── PARSE TICKERS ────────────────────────────────────────────────────────────
+tickers = []
+for t in tickers_str.replace(",", "\n").split("\n"):
+    t = t.strip().upper()
+    if t: tickers.append(t)
 
-# ──────────────────── MAIN UI ────────────────────────────────────────────────
-st.title("📈 Stock Advisor Dashboard")
-
-tickers = [t.strip().upper() for t in tickers_str.split(",") if t.strip()]
-if not tickers:
-    st.info("Enter tickers in the sidebar.")
-    st.stop()
-
+# ─── RUN ANALYSIS ─────────────────────────────────────────────────────────────
 if run_btn:
+    # Save previous signals for change detection
+    if st.session_state["results"] is not None:
+        prev = st.session_state["results"]
+        st.session_state["prev_signals"] = dict(zip(prev["Ticker"], prev["Signal"]))
+
     rows, charts = [], {}
     prog = st.progress(0, text="Analysing...")
     for i, t in enumerate(tickers):
-        prog.progress((i+1)/len(tickers), text=f"Analysing {t}...")
-        row, df = analyse_ticker(t, period, w_mom, w_val, w_qual, w_risk,
-                                  news_key, max_vol, max_dd)
+        prog.progress((i+1)/len(tickers), text=f"Analysing {t} ({i+1}/{len(tickers)})...")
+        row, df = analyse_ticker(t, period, w_mom, w_val, w_qual, w_risk, news_key, max_vol, max_dd)
         if row:
             rows.append(row)
             charts[t] = df
     prog.empty()
     if rows:
-        st.session_state["results"] = (
-            pd.DataFrame(rows)
-            .sort_values("Composite", ascending=False)
-            .reset_index(drop=True)
-        )
-        st.session_state["charts"] = charts
+        df_res = pd.DataFrame(rows).sort_values("Composite", ascending=False).reset_index(drop=True)
+        st.session_state["results"] = df_res
+        st.session_state["charts"]  = charts
     else:
-        st.error("No data returned.")
+        st.error("No data returned. Check your tickers.")
         st.stop()
 
-if st.session_state["results"] is None:
-    st.info("Configure settings in the sidebar, then click **🔄 Run analysis**.")
-    st.stop()
-
-df_all  = st.session_state["results"]
-charts  = st.session_state["charts"]
-df_view = df_all[df_all["Composite"] >= min_score].copy()
-
-# ─── MAIN PAGE TABS ────────────────────────────────────────────────────────────
-tab_sig, tab_val, tab_mom, tab_risk, tab_watch, tab_port, tab_bt, tab_ml = st.tabs([
-    "📊 Signals", "💰 Value & Quality", "⚡ Momentum",
-    "⚠️ Risk & Sentiment", "⭐ Watchlist", "💼 Portfolio",
-    "🕰️ Backtest", "🤖 ML Insights"
+# ─── MAIN TABS ────────────────────────────────────────────────────────────────
+tab_home, tab_signals, tab_discover, tab_etf, tab_portfolio, tab_backtest, tab_ml = st.tabs([
+    "🏠 Home",
+    "📊 Signals",
+    "🔭 Discover",
+    "🌐 ETF Hub",
+    "💼 Portfolio",
+    "📈 Backtest",
+    "🤖 ML Insights",
 ])
 
-# ─── TAB 1: SIGNALS ──────────────────────────────────────────────────────────
-with tab_sig:
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("🟢 Strong Buy", int((df_view["Signal"]=="Strong Buy").sum()))
-    c2.metric("🟡 Buy",        int((df_view["Signal"]=="Buy").sum()))
-    c3.metric("🔵 Hold",       int((df_view["Signal"]=="Hold").sum()))
-    c4.metric("Avg Composite", f"{df_view['Composite'].mean():.1f}")
-    c5.metric("Stocks",        len(df_view))
-    st.markdown("---")
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 1 — HOME DASHBOARD
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_home:
+    st.markdown("### 👋 Welcome to Stock Intelligence")
+    st.caption(f"Last updated: {datetime.now().strftime('%d %b %Y, %H:%M')}  •  Educational tool only")
 
-    left, right = st.columns([2, 1])
-    with left:
-        disp = df_view[[
-            "Ticker", "Sector", "Last Price",
-            "Mom Score", "Value Score", "Qual Score", "Risk Score",
-            "Sentiment", "ML Score", "Composite", "Signal", "Cap Reason"
-        ]].copy()
-        disp["Signal"] = disp["Signal"].apply(lambda s: f"{ICON.get(s,'')} {s}")
-        st.dataframe(
-            disp.style.format({
-                "Last Price": "{:.2f}",
-                "Mom Score": "{:.1f}", "Value Score": "{:.1f}",
-                "Qual Score": "{:.1f}", "Risk Score": "{:.1f}",
-                "Sentiment": "{:.1f}", "ML Score": "{:.1f}",
-                "Composite": "{:.1f}",
-            }),
-            use_container_width=True, height=420
-        )
+    if st.session_state["results"] is None:
+        st.info("👈  Add tickers in the sidebar and click **🔄 Run Analysis** to get started.")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.markdown("""<div class='card'>
+            <h4>📊 Multi-Factor Signals</h4>
+            <p>Momentum, Value, Quality, Risk & Sentiment scored and blended with ElasticNet ML</p>
+            </div>""", unsafe_allow_html=True)
+        with col2:
+            st.markdown("""<div class='card'>
+            <h4>🔭 Stock Discovery</h4>
+            <p>Scan 120+ stocks for growth setups and day-trading opportunities automatically</p>
+            </div>""", unsafe_allow_html=True)
+        with col3:
+            st.markdown("""<div class='card'>
+            <h4>🌐 ETF Hub</h4>
+            <p>Sector rotation, ETF momentum rankings, and expense-ratio-adjusted scoring</p>
+            </div>""", unsafe_allow_html=True)
+    else:
+        df_all = st.session_state["results"]
+        prev   = st.session_state["prev_signals"]
 
-    with right:
-        st.subheader("🔍 Deep Dive")
-        sel  = st.selectbox("Select ticker", df_view["Ticker"].tolist(), key="sel_main")
-        row  = df_view[df_view["Ticker"] == sel].iloc[0]
-        icon = ICON.get(row["Signal"], "")
-        st.markdown(f"### {sel} {icon} {row['Signal']}")
-        if row["Cap Reason"]:
-            st.warning(row["Cap Reason"])
-        ml_trained_label = f"{row['ML Score']:.1f}" if ML_MODEL else f"{row['ML Score']:.1f} *(untrained)*"
-        st.markdown(f"""
-| Factor | Score |
-|---|---|
-| 🚀 Momentum | {row['Mom Score']:.1f} |
-| 💰 Value | {row['Value Score']:.1f} |
-| ⭐ Quality | {row['Qual Score']:.1f} |
-| 🛡️ Risk | {row['Risk Score']:.1f} |
-| 📰 Sentiment | {row['Sentiment']:.1f} |
-| 🤖 ML (ElasticNet) | {ml_trained_label} |
-| **Composite** | **{row['Composite']:.1f}** |
-""")
-        df_price = charts.get(sel)
-        if df_price is not None:
-            ps = safe_series(df_price, "Close")
-            st.line_chart(ps.tail(252), height=200, use_container_width=True)
-        headlines = row.get("Headlines", [])
-        if headlines:
-            st.markdown("**Latest news**")
-            for h in headlines[:5]:
-                st.caption(f"• {h}")
+        # ── Summary metrics
+        sb = int((df_all["Signal"]=="Strong Buy").sum())
+        b  = int((df_all["Signal"]=="Buy").sum())
+        h  = int((df_all["Signal"]=="Hold").sum())
+        r  = int((df_all["Signal"]=="Reduce").sum())
+        s  = int((df_all["Signal"]=="Sell").sum())
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
+        m1.metric("🟢 Strong Buy", sb)
+        m2.metric("🟡 Buy",        b)
+        m3.metric("🔵 Hold",       h)
+        m4.metric("🟠 Reduce",     r)
+        m5.metric("🔴 Sell",       s)
+        m6.metric("Avg Score",     f"{df_all['Composite'].mean():.1f}")
+        st.markdown("---")
+
+        # ── Signal changes
+        changes = []
+        for _, row in df_all.iterrows():
+            old = prev.get(row["Ticker"])
+            if old and old != row["Signal"]:
+                changes.append((row["Ticker"], old, row["Signal"]))
+        if changes:
+            st.markdown("#### 🔔 Signal Changes Since Last Run")
+            for t, old, new in changes:
+                arrow = "⬆️" if ["Sell","Reduce","Hold","Buy","Strong Buy"].index(new) > ["Sell","Reduce","Hold","Buy","Strong Buy"].index(old) else "⬇️"
+                st.markdown(f"**{t}** {arrow} {SIGNAL_ICON.get(old,'')} {old} → {SIGNAL_ICON.get(new,'')} {new}")
+            st.markdown("---")
+
+        # ── Top picks cards
+        st.markdown("#### 🏆 Top Picks")
+        top = df_all[df_all["Signal"].isin(["Strong Buy","Buy"])].head(6)
+        if top.empty:
+            st.info("No Buy or Strong Buy signals in current analysis.")
+        else:
+            cols = st.columns(min(len(top), 3))
+            for idx, (_, row) in enumerate(top.iterrows()):
+                with cols[idx % 3]:
+                    sig_c = SIGNAL_COLOR.get(row["Signal"], "#aaa")
+                    pct   = f"{row['1M Mom']:+.1%}" if isinstance(row['1M Mom'], float) else "N/A"
+                    st.markdown(f"""
+<div style='background:#1c2333;border:1px solid {sig_c}44;border-left:4px solid {sig_c};
+border-radius:10px;padding:14px;margin-bottom:10px'>
+<div style='font-size:18px;font-weight:700;color:{sig_c}'>{row['Ticker']}</div>
+<div style='font-size:11px;color:#8892a4;margin-bottom:6px'>{row.get('Name','')}</div>
+<div style='display:flex;justify-content:space-between'>
+  <span style='font-size:20px;font-weight:700'>${row['Last Price']:.2f}</span>
+  <span style='font-size:13px;color:{sig_c}'>{SIGNAL_ICON.get(row['Signal'],'')} {row['Signal']}</span>
+</div>
+<div style='display:flex;gap:12px;margin-top:8px;font-size:12px;color:#8892a4'>
+  <span>Score: <b style='color:#eee'>{row['Composite']}</b></span>
+  <span>1M: <b style='color:{"#00c853" if row["1M Mom"]>0 else "#ff1744"}'>{pct}</b></span>
+  <span>Vol: <b style='color:#eee'>{row['30D Vol']:.0%}</b></span>
+</div>
+</div>""", unsafe_allow_html=True)
+
+        # ── Watchlist quick view
         wl = st.session_state["watchlist"]
-        if sel in wl:
-            if st.button(f"⭐ Remove {sel} from watchlist"):
-                wl.discard(sel)
-        else:
-            if st.button(f"☆ Add {sel} to watchlist"):
-                wl.add(sel)
+        if wl:
+            st.markdown("---")
+            st.markdown("#### ⭐ Watchlist")
+            wl_df = df_all[df_all["Ticker"].isin(wl)]
+            if not wl_df.empty:
+                for _, row in wl_df.iterrows():
+                    sig_c = SIGNAL_COLOR.get(row["Signal"], "#aaa")
+                    st.markdown(f"**{row['Ticker']}** `${row['Last Price']:.2f}` &nbsp; {sig_badge(row['Signal'])} &nbsp; Score: **{row['Composite']}**", unsafe_allow_html=True)
 
-# ─── TAB 2: VALUE & QUALITY ───────────────────────────────────────────────────
-with tab_val:
-    st.caption("P/E is scored relative to sector median. See 'Sector PE' column.")
-    cols2 = ["Ticker","Sector","Value Score","P/E","Sector PE","P/S","EV/EBITDA",
-             "FCF Yield","Qual Score","ROE","Margin","D/E","Curr Ratio","Accrual"]
-    fmt2  = {"Value Score":"{:.1f}","P/E":"{:.1f}","Sector PE":"{:.0f}","P/S":"{:.1f}",
-             "EV/EBITDA":"{:.1f}","FCF Yield":"{:.1%}","Qual Score":"{:.1f}",
-             "ROE":"{:.1%}","Margin":"{:.1%}","D/E":"{:.1f}","Curr Ratio":"{:.2f}",
-             "Accrual":"{:.2f}"}
-    av2 = [c for c in cols2 if c in df_view.columns]
-    st.dataframe(df_view[av2].style.format({k:v for k,v in fmt2.items() if k in av2}),
-                 use_container_width=True, height=420)
-
-# ─── TAB 3: MOMENTUM ──────────────────────────────────────────────────────────
-with tab_mom:
-    cols3 = ["Ticker","Mom Score","1M Mom","3M Mom","6M Mom","12M Mom",
-             "Above MA50","Above MA200"]
-    fmt3  = {"Mom Score":"{:.1f}","1M Mom":"{:.1%}","3M Mom":"{:.1%}",
-             "6M Mom":"{:.1%}","12M Mom":"{:.1%}"}
-    av3 = [c for c in cols3 if c in df_view.columns]
-    st.dataframe(df_view[av3].style.format({k:v for k,v in fmt3.items() if k in av3}),
-                 use_container_width=True, height=420)
-
-# ─── TAB 4: RISK & SENTIMENT ──────────────────────────────────────────────────
-with tab_risk:
-    cols4 = ["Ticker","Risk Score","30D Vol","Dist 52W Hi","Max DD",
-             "Sentiment","News Sent","Analyst Rec","EPS Surprise","Cap Reason"]
-    fmt4  = {"Risk Score":"{:.1f}","30D Vol":"{:.1%}","Dist 52W Hi":"{:.1%}",
-             "Max DD":"{:.1%}","Sentiment":"{:.1f}","News Sent":"{:.1f}",
-             "Analyst Rec":"{:.2f}","EPS Surprise":"{:.1%}"}
-    av4 = [c for c in cols4 if c in df_view.columns]
-    st.dataframe(df_view[av4].style.format({k:v for k,v in fmt4.items() if k in av4}),
-                 use_container_width=True, height=420)
-
-# ─── TAB 5: WATCHLIST ─────────────────────────────────────────────────────────
-with tab_watch:
-    st.subheader("⭐ Your Watchlist")
-    wl = st.session_state["watchlist"]
-    new_watch = st.text_input("Add ticker to watchlist", key="wl_add")
-    if st.button("Add", key="wl_add_btn") and new_watch.strip():
-        wl.add(new_watch.strip().upper())
-    if not wl:
-        st.info("No stocks in your watchlist yet.")
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 2 — SIGNALS
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_signals:
+    if st.session_state["results"] is None:
+        st.info("Run analysis first.")
     else:
-        wl_df = df_all[df_all["Ticker"].isin(wl)].copy()
-        if wl_df.empty:
-            st.warning("Watchlist tickers not in current analysis.")
-            for t in sorted(wl):
-                col_a, col_b = st.columns([3, 1])
-                col_a.write(t)
-                if col_b.button("Remove", key=f"rm_{t}"):
-                    wl.discard(t)
-        else:
-            wl_df["Signal"] = wl_df["Signal"].apply(lambda s: f"{ICON.get(s,'')} {s}")
+        df_all  = st.session_state["results"]
+        charts  = st.session_state["charts"]
+        df_view = df_all[df_all["Composite"] >= min_score].copy()
+
+        left, right = st.columns([3, 2])
+
+        with left:
+            # Filter controls
+            fc1, fc2 = st.columns(2)
+            sig_filter = fc1.multiselect("Filter by signal",
+                ["Strong Buy","Buy","Hold","Reduce","Sell"],
+                default=["Strong Buy","Buy","Hold","Reduce","Sell"])
+            sec_filter = fc2.multiselect("Filter by sector",
+                sorted(df_view["Sector"].unique().tolist()), default=[])
+            df_filt = df_view[df_view["Signal"].isin(sig_filter)]
+            if sec_filter:
+                df_filt = df_filt[df_filt["Sector"].isin(sec_filter)]
+
+            # CSV export
+            csv = df_filt.drop(columns=["Headlines","_close"], errors="ignore").to_csv(index=False)
+            st.download_button("⬇️ Export CSV", csv, "signals.csv", "text/csv", key="dl_sig")
+
+            disp = df_filt[[
+                "Ticker","Name","Sector","Last Price",
+                "Mom Score","Value Score","Qual Score","Risk Score",
+                "Sentiment","ML Score","Composite","Signal","Cap Reason"
+            ]].copy()
+            disp["Signal"] = disp["Signal"].apply(lambda s: f"{SIGNAL_ICON.get(s,'')} {s}")
             st.dataframe(
-                wl_df[["Ticker","Last Price","Composite","Signal","ML Score"]].style.format(
-                    {"Last Price":"{:.2f}","Composite":"{:.1f}","ML Score":"{:.1f}"}
-                ),
-                use_container_width=True
+                disp.style.format({
+                    "Last Price":"{:.2f}","Mom Score":"{:.1f}","Value Score":"{:.1f}",
+                    "Qual Score":"{:.1f}","Risk Score":"{:.1f}","Sentiment":"{:.1f}",
+                    "ML Score":"{:.1f}","Composite":"{:.1f}",
+                }).background_gradient(subset=["Composite"], cmap="RdYlGn", vmin=0, vmax=100),
+                use_container_width=True, height=480
             )
-            for t in sorted(wl):
-                if st.button(f"Remove {t}", key=f"rmwl_{t}"):
-                    wl.discard(t)
 
-# ─── TAB 6: PORTFOLIO OVERLAY ─────────────────────────────────────────────────
-with tab_port:
-    st.subheader("💼 Portfolio Overlay")
-    st.caption("Enter your holdings to see risk concentration and signal alignment.")
-    owned = st.session_state["owned"]
-    pa, pb, pc, pd_ = st.columns(4)
-    pt = pa.text_input("Ticker", key="pt")
-    pq = pb.number_input("Quantity", min_value=0.0, step=1.0, key="pq")
-    pp = pc.number_input("Avg buy price", min_value=0.0, step=0.01, key="pp")
-    if pd_.button("Add holding", key="padd") and pt.strip():
-        owned[pt.strip().upper()] = {"qty": pq, "avg_price": pp}
-    if not owned:
-        st.info("No holdings added yet.")
-    else:
-        port_rows = []
-        for t, h in owned.items():
-            row_sig = df_all[df_all["Ticker"] == t]
-            if not row_sig.empty:
-                r = row_sig.iloc[0]
-                current_price = r["Last Price"]
-                value   = h["qty"] * current_price
-                cost    = h["qty"] * h["avg_price"]
-                pnl     = value - cost
-                pnl_pct = (pnl/cost) if cost > 0 else 0
-                port_rows.append({
-                    "Ticker":     t,
-                    "Qty":        h["qty"],
-                    "Avg Price":  h["avg_price"],
-                    "Curr Price": current_price,
-                    "Value ($)":  round(value, 2),
-                    "P&L ($)":    round(pnl, 2),
-                    "P&L %":      pnl_pct,
-                    "Signal":     f"{ICON.get(r['Signal'],'')} {r['Signal']}",
-                    "Composite":  r["Composite"],
-                    "ML Score":   r["ML Score"],
-                    "Risk Score": r["Risk Score"],
-                    "30D Vol":    r["30D Vol"],
-                })
+        with right:
+            st.markdown("#### 🔍 Deep Dive")
+            tlist = df_filt["Ticker"].tolist()
+            if not tlist:
+                st.info("No tickers match current filters.")
             else:
-                port_rows.append({"Ticker": t, "Qty": h["qty"],
-                    "Avg Price": h["avg_price"], "Curr Price": "N/A",
-                    "Value ($)": "N/A", "P&L ($)": "N/A", "P&L %": "N/A",
-                    "Signal": "Run analysis", "Composite": "N/A",
-                    "ML Score": "N/A", "Risk Score": "N/A", "30D Vol": "N/A"})
-        port_df = pd.DataFrame(port_rows)
-        num_cols = {"Avg Price":"{:.2f}","Curr Price":"{:.2f}",
-                    "Value ($)":"{:.2f}","P&L ($)":"{:.2f}",
-                    "P&L %":"{:.1%}","Composite":"{:.1f}",
-                    "ML Score":"{:.1f}","Risk Score":"{:.1f}","30D Vol":"{:.1%}"}
-        fmt_avail = {k: v for k, v in num_cols.items()
-                     if k in port_df.columns
-                     and port_df[k].apply(lambda x: isinstance(x, (int, float))).all()}
-        st.dataframe(port_df.style.format(fmt_avail), use_container_width=True)
-        numeric_port = port_df[port_df["Value ($)"].apply(lambda x: isinstance(x, (int, float)))]
-        if not numeric_port.empty:
-            total_val = numeric_port["Value ($)"].sum()
-            numeric_port = numeric_port.copy()
-            numeric_port["Weight"] = numeric_port["Value ($)"] / total_val
-            st.markdown("**Concentration check**")
-            heavy = numeric_port[numeric_port["Weight"] > 0.15]
-            if not heavy.empty:
-                for _, r in heavy.iterrows():
-                    st.warning(f"⚠️ {r['Ticker']} is {r['Weight']:.0%} of portfolio (>15%)")
-            high_risk = numeric_port[
-                numeric_port["30D Vol"].apply(lambda x: isinstance(x, float) and x > 0.5)
-            ]
-            if not high_risk.empty:
-                st.warning(f"⚠️ High-volatility holdings: {', '.join(high_risk['Ticker'].tolist())}")
-        to_rm = st.selectbox("Remove a holding", [""] + list(owned.keys()), key="prm")
-        if st.button("Remove", key="prm_btn") and to_rm:
-            owned.pop(to_rm, None)
+                sel  = st.selectbox("Select ticker", tlist, key="sel_dd")
+                row  = df_filt[df_filt["Ticker"] == sel].iloc[0]
+                wl   = st.session_state["watchlist"]
+                prev = st.session_state["prev_signals"]
 
-# ─── TAB 7: BACKTEST ──────────────────────────────────────────────────────────
-with tab_bt:
-    st.subheader("🕰️ Simple Backtest")
-    st.caption(
-        "Equal-weight portfolio of current Buy/Strong Buy signals vs SPY benchmark. "
-        "Based on 1-year historical returns."
-    )
-    if st.button("▶️ Run backtest"):
-        with st.spinner("Running backtest..."):
-            cum_port, cum_both = simple_backtest(charts, df_all)
-        if cum_both is not None:
-            st.line_chart(cum_both, height=350, use_container_width=True)
-            final = cum_both.iloc[-1]
-            bc1, bc2, bc3 = st.columns(3)
-            bc1.metric("Portfolio total return", f"{final['Portfolio']:.1%}")
-            bc2.metric("SPY total return",       f"{final['SPY']:.1%}")
-            bc3.metric("Alpha",                  f"{final['Portfolio']-final['SPY']:.1%}")
-        elif cum_port is not None:
-            st.line_chart(cum_port, height=300, use_container_width=True)
-        else:
-            st.warning("Not enough Buy/Strong Buy signals to run a backtest.")
+                sig_c = SIGNAL_COLOR.get(row["Signal"], "#aaa")
+                old_sig = prev.get(sel)
+                change_str = ""
+                if old_sig and old_sig != row["Signal"]:
+                    change_str = f" _(was {old_sig})_"
 
-# ─── TAB 8: ML INSIGHTS ───────────────────────────────────────────────────────
-with tab_ml:
-    st.subheader("🤖 ElasticNet Model Insights")
-    if ML_MODEL is None:
-        st.info(
-            "No trained model found. Run the trainer first:\n\n"
-            "```bash\npython train_model.py\n```\n\n"
-            "This will download 3 years of price history for 50 stocks, "
-            "train an ElasticNet logistic model, and save artifacts to ./artifacts/."
-        )
-    else:
-        # Model metadata
-        mc1, mc2, mc3, mc4 = st.columns(4)
-        mc1.metric("Train AUC",  f"{ML_META['train_auc']:.3f}")
-        mc2.metric("Test AUC",   f"{ML_META['test_auc']:.3f}")
-        mc3.metric("Best C",     f"{ML_META['best_C']:.4f}")
-        mc4.metric("l1 ratio",   f"{ML_META['best_l1_ratio']:.2f}")
-        st.caption(f"Trained: {ML_META.get('trained_at','?')[:19]}  |  "
-                   f"Features: {', '.join(ML_META['feature_cols'])}")
-        st.markdown("---")
+                st.markdown(f"""
+<div style='background:#1c2333;border:1px solid {sig_c}44;border-left:4px solid {sig_c};
+border-radius:10px;padding:16px'>
+<div style='font-size:22px;font-weight:700'>{sel} <span style='color:{sig_c}'>{SIGNAL_ICON.get(row['Signal'],'')} {row['Signal']}</span></div>
+<div style='color:#8892a4;font-size:12px'>{row.get('Name','')} · {row['Sector']}</div>
+</div>""", unsafe_allow_html=True)
 
-        # Feature coefficients
-        st.markdown("#### Feature Coefficients (ElasticNet)")
-        st.caption(
-            "Positive = model associates this feature with being in the top-30% "
-            "next-month return bucket. Negative = associated with underperformance."
-        )
-        coef_df = pd.DataFrame(
-            [{"Feature": k, "Coefficient": v}
-             for k, v in ML_META["coef"].items()]
-        ).sort_values("Coefficient", key=abs, ascending=False).reset_index(drop=True)
-        st.dataframe(
-            coef_df.style.format({"Coefficient": "{:+.4f}"})
-                         .bar(subset="Coefficient", color=["#d65f5f", "#5fba7d"]),
-            use_container_width=True
-        )
-        st.markdown("---")
+                if row["Cap Reason"]: st.warning(row["Cap Reason"])
+                if change_str: st.info(f"🔔 Signal changed{change_str}")
 
-        # Per-stock ML probability table
-        st.markdown("#### ML Probability per Stock")
-        st.caption("P(top-30% next month) — from the ElasticNet model.")
-        ml_disp = df_view[["Ticker", "Sector", "ML Prob", "ML Score", "Signal"]].copy()
-        ml_disp = ml_disp.sort_values("ML Prob", ascending=False).reset_index(drop=True)
-        ml_disp["Signal"] = ml_disp["Signal"].apply(lambda s: f"{ICON.get(s,'')} {s}")
-        st.dataframe(
-            ml_disp.style.format({"ML Prob": "{:.1%}", "ML Score": "{:.1f}"}),
-            use_container_width=True
-        )
+                # Factor radar
+                fa, fb = st.columns(2)
+                fa.metric("🚀 Momentum",   f"{row['Mom Score
